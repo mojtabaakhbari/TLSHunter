@@ -10,6 +10,10 @@ Usage examples
   python scanner.py 1.2.3.4 10.0.0.0/24 -f hosts.txt --sni example.com -o ok.txt
   python scanner.py -f cidrs.txt --ping --sni vercel.com --match vercel,now.sh
   python scanner.py 142.250.0.0/16 --port 443 --workers 800
+
+  # SNI file: test every IP against every SNI (IPs × SNIs combinations)
+  python scanner.py -f hosts.txt --sni-file snis.txt -o results.txt \
+      --ips-out matched_ips.txt --snis-out matched_snis.txt
 """
 
 from __future__ import annotations
@@ -160,6 +164,28 @@ def load_targets(inline: list[str], file_path: str | None) -> list[str]:
 
     return out
 
+def load_snis(file_path: str) -> list[str]:
+    """Load SNI hostnames from a file (one per line; '#' comments allowed).
+
+    Returns a list of unique, non-empty SNI strings preserving file order.
+    An empty string token is kept as-is — it means "no-SNI probe".
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    try:
+        with open(file_path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = _COMMENT_RE.sub("", raw).strip()
+                if line not in seen:
+                    seen.add(line)
+                    if line:
+                        out.append(line)
+    except OSError as e:
+        log.error("Cannot read SNI file %r: %s", file_path, e)
+        sys.exit(2)
+    return out
+
+
 def raise_fd_limit(needed: int) -> None:
     if not _HAS_RESOURCE:
         return
@@ -280,6 +306,15 @@ def _stats_panel(stats: Stats, phase_totals: dict[str, int]) -> Panel:
     tbl.add_row("", "")
     tbl.add_row(Text("Pipeline", style="bold dim"), "")
     tbl.add_row("Loaded", Text(f"{phase_totals.get('loaded', 0):,}", style="bold"))
+    if phase_totals.get("snis", 1) > 1:
+        tbl.add_row("SNIs", Text(f"{phase_totals.get('snis', 1):,}"))
+        tbl.add_row(
+            "Combinations",
+            Text(
+                f"{phase_totals.get('loaded', 0) * phase_totals.get('snis', 1):,}",
+                style="bold cyan",
+            ),
+        )
     if "ping_alive" in phase_totals:
         tbl.add_row("Ping alive", Text(f"{phase_totals['ping_alive']:,}"))
     if "tcp_open" in phase_totals:
@@ -963,28 +998,13 @@ def _ip_sort_key(ip: str) -> tuple[int, int]:
         return (99, 0)
 
 
-def write_output(
-    path: str, results: list[dict], keywords: list[str], matched_only: bool
-) -> None:
-    """Stream rows to <path>.tmp then atomically rename to <path>."""
-    ts = datetime.now(timezone.utc).isoformat()
-    rows = [r for r in results if (r.get("matched") or not matched_only)]
-    rows.sort(key=lambda r: _ip_sort_key(r.get("ip", "")))
-
+def _atomic_write(path: str, lines: list[str]) -> None:
+    """Write lines to <path>.tmp then atomically rename to <path>."""
     tmp = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(f"# Generated {ts}\n")
-            f.write(
-                f"# matched_keywords={','.join(keywords) if keywords else '(none)'}\n"
-            )
-            f.write(f"# rows={len(rows)}\n")
-            f.write("# columns: ip<TAB>sni<TAB>matched<TAB>cipher<TAB>cert_names\n")
-            for r in rows:
-                f.write(
-                    f"{r['ip']}\t{r.get('sni') or ''}\t{int(bool(r.get('matched')))}"
-                    f"\t{r.get('cipher') or ''}\t{', '.join(r.get('names', []))}\n"
-                )
+            for line in lines:
+                f.write(line)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -992,6 +1012,69 @@ def write_output(
         except OSError:
             pass
         raise
+
+
+def write_output(
+    path: str,
+    results: list[dict],
+    keywords: list[str],
+    matched_only: bool,
+    ips_out: str | None = None,
+    snis_out: str | None = None,
+) -> None:
+    """Write the main TSV results file, and optionally separate IPs / SNIs files.
+
+    main output (path)
+        TSV with columns: ip, sni, matched, cipher, cert_names
+        Atomic write via a .tmp rename.
+
+    ips_out (optional)
+        One unique IP per line (sorted numerically) for every successful TLS
+        result in the written rows.  No header — ready to feed back into -f.
+
+    snis_out (optional)
+        One unique SNI per line (sorted alphabetically) for every successful
+        TLS result in the written rows.  No header — ready to feed back into
+        --sni-file.
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    rows = [r for r in results if (r.get("matched") or not matched_only)]
+    rows.sort(key=lambda r: _ip_sort_key(r.get("ip", "")))
+
+    lines: list[str] = [
+        f"# Generated {ts}\n",
+        f"# matched_keywords={','.join(keywords) if keywords else '(none)'}\n",
+        f"# rows={len(rows)}\n",
+        "# columns: ip<TAB>sni<TAB>matched<TAB>cipher<TAB>cert_names\n",
+    ]
+    for r in rows:
+        lines.append(
+            f"{r['ip']}\t{r.get('sni') or ''}\t{int(bool(r.get('matched')))}"
+            f"\t{r.get('cipher') or ''}\t{', '.join(r.get('names', []))}\n"
+        )
+    _atomic_write(path, lines)
+
+    if ips_out:
+        seen_ips: list[str] = []
+        seen_set: set[str] = set()
+        for r in rows:
+            ip = r.get("ip", "")
+            if ip and ip not in seen_set:
+                seen_set.add(ip)
+                seen_ips.append(ip)
+        seen_ips.sort(key=_ip_sort_key)
+        _atomic_write(ips_out, [ip + "\n" for ip in seen_ips])
+
+    if snis_out:
+        seen_snis: list[str] = []
+        seen_sni_set: set[str] = set()
+        for r in rows:
+            sni = r.get("sni") or ""
+            if sni and sni not in seen_sni_set:
+                seen_sni_set.add(sni)
+                seen_snis.append(sni)
+        seen_snis.sort()
+        _atomic_write(snis_out, [sni + "\n" for sni in seen_snis])
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -1014,6 +1097,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=[],
         help="SNI to send (repeatable). Use '' for no-SNI probe. "
         "If omitted, defaults to a single no-SNI probe.",
+    )
+    p.add_argument(
+        "--sni-file",
+        default=None,
+        metavar="FILE",
+        help="File of SNI hostnames (one per line; '#' comments allowed). "
+        "Combined with any --sni values. Every IP is probed against every SNI "
+        "(IPs × SNIs total combinations).",
+    )
+    p.add_argument(
+        "--ips-out",
+        default=None,
+        metavar="FILE",
+        help="Write one unique IP per line (numerically sorted) for every "
+        "successful TLS result. Ready to reuse with -f.",
+    )
+    p.add_argument(
+        "--snis-out",
+        default=None,
+        metavar="FILE",
+        help="Write one unique SNI per line (alphabetically sorted) for every "
+        "successful TLS result. Ready to reuse with --sni-file.",
     )
     p.add_argument(
         "--match",
@@ -1134,8 +1239,23 @@ async def amain(args: argparse.Namespace) -> int:
     snis: list[str | None] = []
     for s in args.sni:
         snis.append(None if s == "" else s)
+
+    if args.sni_file:
+        file_snis = load_snis(args.sni_file)
+        console.print(f"Loaded [bold]{len(file_snis):,}[/] SNIs from [dim]{args.sni_file}[/].")
+        for s in file_snis:
+            candidate: str | None = None if s == "" else s
+            if candidate not in snis:
+                snis.append(candidate)
+
     if not snis:
         snis = [None]
+
+    if len(snis) > 1:
+        console.print(
+            f"Testing [bold]{len(ips):,}[/] IPs × [bold]{len(snis):,}[/] SNIs "
+            f"= [bold cyan]{len(ips) * len(snis):,}[/] combinations."
+        )
 
     keywords = [k.strip().lower() for k in args.match.split(",") if k.strip()]
     if keywords and not _HAS_CRYPTO:
@@ -1149,15 +1269,15 @@ async def amain(args: argparse.Namespace) -> int:
             "[yellow]Warning:[/] 'ping' binary not found in PATH \u2014 --ping will be skipped."
         )
         args.ping = False
-
-    stats = Stats(total=len(ips))
+    total_combinations = len(ips) * len(snis)
+    stats = Stats(total=total_combinations)
     feed: Deque[Text] = deque(maxlen=500)
     successes: Deque[Text] = deque(maxlen=1000)
     global _RUN_T0
     _RUN_T0 = time.monotonic()
     progress = make_progress()
 
-    phase_totals: dict[str, int] = {"loaded": len(ips)}
+    phase_totals: dict[str, int] = {"loaded": len(ips), "snis": len(snis)}
 
     def _phase_marker(label: str, n: int) -> None:
         feed.append(
@@ -1334,7 +1454,8 @@ async def amain(args: argparse.Namespace) -> int:
 
     try:
         if final_results:
-            write_output(args.output, final_results, keywords, args.matched_only)
+            write_output(args.output, final_results, keywords, args.matched_only,
+                         ips_out=args.ips_out, snis_out=args.snis_out)
         else:
             res = [
                 {"ip": ip, "sni": None, "names": [], "cipher": None, "matched": False}
@@ -1342,6 +1463,10 @@ async def amain(args: argparse.Namespace) -> int:
             ]
             write_output(args.output, res, keywords, matched_only=False)
         console.print(f"[green]\u2713[/] Saved \u2192 [bold]{args.output}[/]")
+        if args.ips_out and final_results:
+            console.print(f"[green]\u2713[/] IPs  \u2192 [bold]{args.ips_out}[/]")
+        if args.snis_out and final_results:
+            console.print(f"[green]\u2713[/] SNIs \u2192 [bold]{args.snis_out}[/]")
     except OSError as e:
         console.print(f"[red]Failed to write {args.output}: {e}[/]")
         rc = rc or 1
