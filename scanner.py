@@ -178,7 +178,7 @@ def load_snis(file_path: str) -> list[str]:
                 line = _COMMENT_RE.sub("", raw).strip()
                 if line not in seen:
                     seen.add(line)
-                    if line:
+                    if line: 
                         out.append(line)
     except OSError as e:
         log.error("Cannot read SNI file %r: %s", file_path, e)
@@ -681,85 +681,68 @@ async def tcp_phase(
 async def tls_check(
     ip: str,
     port: int,
-    snis: list[str | None],
+    sni: str | None,
     ctx: ssl.SSLContext,
     timeout: float,
     retries: int = 0,
     retry_delay: float = 0.2,
 ) -> dict | None:
-    """Try each SNI in order; return on first successful handshake.
+    """Probe a single (ip, sni) pair and return a result dict on success or None.
 
-    Two-level retry strategy:
-
-      * Inner (per-SNI) retry on *transient* failures only:
-        `asyncio.TimeoutError` and non-deterministic `OSError`. These are
-        almost always packet loss, conntrack saturation, or the upstream
-        path rate-limiting our SYN burst — exactly the cases where one
-        more attempt with a small backoff recovers the truth.
-        Repeated up to `retries` extra times with backoff + jitter.
-
-      * Outer (across-SNI) fallthrough on *TLS-level* failures:
-        `ssl.SSLError` and mid-handshake `ConnectionResetError`. These
-        are deterministic for the SNI used, so we move on to the next
-        SNI immediately (no inner retry, no backoff).
-
-      * Hard-dead failures (`ConnectionRefusedError`, `EHOSTUNREACH`,
-        `ENETUNREACH`, ...) short-circuit the whole function with `None`,
-        because no SNI choice and no retry will ever get a handshake.
+    Retry strategy:
+      * Transient failures (TimeoutError, non-fatal OSError) are retried up to
+        `retries` extra times with exponential backoff + jitter.
+      * TLS-level failures (SSLError, ConnectionResetError) are deterministic
+        for this SNI — return None immediately, no retry.
+      * Hard-dead failures (ConnectionRefusedError, EHOSTUNREACH, …) return
+        None immediately — no other SNI will help either, but that decision
+        is now made by the caller which owns the full SNI list.
     """
-    for sni in snis:
-        tcp_dead = False
-        for attempt in range(retries + 1):
-            writer: asyncio.StreamWriter | None = None
-            transient = False
-            try:
-                _, writer = await asyncio.wait_for(
-                    asyncio.open_connection(ip, port, ssl=ctx, server_hostname=sni),
-                    timeout,
+    for attempt in range(retries + 1):
+        writer: asyncio.StreamWriter | None = None
+        transient = False
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port, ssl=ctx, server_hostname=sni),
+                timeout,
+            )
+            cipher = writer.get_extra_info("cipher")
+            ssl_obj = writer.get_extra_info("ssl_object")
+            names: list[str] = []
+            if ssl_obj is not None:
+                try:
+                    der = ssl_obj.getpeercert(binary_form=True)
+                except Exception:
+                    der = None
+                if der:
+                    names = cert_names_from_der(der)
+            if not names:
+                names = cert_names_from_dict(
+                    writer.get_extra_info("peercert") or {}
                 )
-                cipher = writer.get_extra_info("cipher")
-                ssl_obj = writer.get_extra_info("ssl_object")
-                names: list[str] = []
-                if ssl_obj is not None:
-                    try:
-                        der = ssl_obj.getpeercert(binary_form=True)
-                    except Exception:
-                        der = None
-                    if der:
-                        names = cert_names_from_der(der)
-                if not names:
-                    names = cert_names_from_dict(
-                        writer.get_extra_info("peercert") or {}
-                    )
-                return {
-                    "ip": ip,
-                    "sni": sni,
-                    "names": names,
-                    "cipher": cipher[0] if cipher else None,
-                }
-            except ssl.SSLError:
-                break
-            except ConnectionResetError:
-                break
-            except ConnectionRefusedError:
-                return None
-            except asyncio.TimeoutError:
-                transient = True
-            except OSError as e:
-                if e.errno in _DEAD_ERRNOS:
-                    return None
-                transient = True
-            except Exception:
-                log.debug("tls unexpected %s sni=%r", ip, sni, exc_info=True)
-                return {"_error": True} 
-            finally:
-                await _close_writer(writer)
-            if transient and attempt < retries:
-                await _retry_sleep(attempt, retry_delay)
-            elif transient:
-                tcp_dead = True
-        if tcp_dead:
+            return {
+                "ip": ip,
+                "sni": sni,
+                "names": names,
+                "cipher": cipher[0] if cipher else None,
+            }
+        except (ssl.SSLError, ConnectionResetError):
             return None
+        except ConnectionRefusedError:
+            return None
+        except asyncio.TimeoutError:
+            transient = True
+        except OSError as e:
+            if e.errno in _DEAD_ERRNOS:
+                return None
+            transient = True
+        except Exception:
+            log.debug("tls unexpected %s sni=%r", ip, sni, exc_info=True)
+            return {"_error": True}
+        finally:
+            await _close_writer(writer)
+        if transient and attempt < retries:
+            await _retry_sleep(attempt, retry_delay)
     return None
 
 
@@ -778,25 +761,26 @@ async def tls_phase(
     successes: Deque[Text],
     out: list[dict],
 ) -> None:
-    """Appends successful TLS results to `out` (caller-owned)."""
+    """Test every (ip, sni) combination independently; appends successes to `out`."""
+    pairs = [(ip, sni) for ip in ips for sni in snis]
     stats.phase = f"tls:{port}"
-    stats.total = len(ips)
+    stats.total = len(pairs)
     stats.tested = stats.success = stats.fail = stats.error = 0
     stats.matched = 0
     stats.phase_t0 = time.monotonic()
-    task = progress.add_task(f"TLS :{port}", total=len(ips))
+    task = progress.add_task(f"TLS :{port}", total=len(pairs))
 
     ctx = make_tls_context()
-    q: asyncio.Queue[str] = asyncio.Queue(maxsize=workers * 4)
+    q: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue(maxsize=workers * 4)
 
     async def worker() -> None:
         while True:
-            ip = await q.get()
+            ip, sni = await q.get()
             try:
                 res = await tls_check(
                     ip,
                     port,
-                    snis,
+                    sni,
                     ctx,
                     timeout,
                     retries=retries,
@@ -804,7 +788,8 @@ async def tls_phase(
                 )
                 if res is None:
                     stats.fail += 1
-                    _feed_fail(feed, "tls", ip, "no handshake")
+                    sni_disp = sni if sni is not None else "—"
+                    _feed_fail(feed, "tls", ip, f"sni={sni_disp} no handshake")
                 elif res.get("_error"):
                     stats.error += 1
                     _feed_err(feed, "tls", ip, "unexpected")
@@ -828,7 +813,7 @@ async def tls_phase(
             except Exception as e:
                 stats.error += 1
                 _feed_err(feed, "tls", ip, type(e).__name__)
-                log.debug("tls worker error %s", ip, exc_info=True)
+                log.debug("tls worker error %s sni=%r", ip, sni, exc_info=True)
             finally:
                 stats.tested += 1
                 progress.update(task, advance=1)
@@ -837,8 +822,8 @@ async def tls_phase(
     workers_t = [asyncio.create_task(worker()) for _ in range(workers)]
 
     async def producer() -> None:
-        for ip in ips:
-            await q.put(ip)
+        for pair in pairs:
+            await q.put(pair)
 
     prod = asyncio.create_task(producer())
     try:
@@ -866,21 +851,24 @@ async def tcp_tls_pipeline(
     phase_totals: dict[str, int],
     out: list[dict],
 ) -> None:
-    """Fused TCP+TLS phase: as soon as a TCP probe succeeds, the IP is forwarded
-    to a TLS worker. TCP and TLS stages run concurrently with independent
-    worker pools, so the TLS pool never idles waiting for the TCP sweep to
-    finish, and dead IPs short-circuit without paying the (longer) TLS
-    timeout.
+    """Fused TCP+TLS pipeline.
+
+    TCP workers probe each IP once. On success, all (ip, sni) pairs for that
+    IP are forwarded to TLS workers so every combination is tested
+    independently. TCP and TLS stages run concurrently.
 
     Stats accounting:
-      - stats.total      = len(ips)                (whole-pipeline denominator)
-      - stats.tested     +=1 per IP fully processed (TCP-fail OR TLS-complete)
+      - stats.total      = len(ips) * len(snis)  (all combinations)
+      - stats.tested     +=1 per (ip, sni) pair fully processed
       - stats.success    = TLS handshake successes
-      - stats.fail/error = TCP-level + TLS-level negatives, combined
+      - stats.fail/error = TCP-level + TLS-level negatives combined
       - phase_totals["tcp_open"] / ["tls_success"] update live for the UI.
+
+    TCP failures count as `len(snis)` tested/failed items since none of the
+    SNI pairs for that IP will be attempted.
     """
     stats.phase = f"tcp+tls:{port}"
-    stats.total = len(ips)
+    stats.total = len(ips) * len(snis)
     stats.tested = stats.success = stats.fail = stats.error = 0
     stats.matched = 0
     stats.phase_t0 = time.monotonic()
@@ -890,8 +878,10 @@ async def tcp_tls_pipeline(
 
     ctx = make_tls_context()
     in_q: asyncio.Queue[str] = asyncio.Queue(maxsize=tcp_workers * 4)
-    tls_q: asyncio.Queue[str] = asyncio.Queue(maxsize=tls_workers * 4)
-    tcp_open_count = 0  
+    tls_q: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue(
+        maxsize=tls_workers * 4
+    )
+    tcp_open_count = 0
 
     async def tcp_worker() -> None:
         nonlocal tcp_open_count
@@ -909,30 +899,30 @@ async def tcp_tls_pipeline(
                     tcp_open_count += 1
                     phase_totals["tcp_open"] = tcp_open_count
                     _feed_ok(feed, "tcp", ip, f":{port} open")
-                    progress.update(tls_task, total=tcp_open_count)
-                    await tls_q.put(ip)
+                    progress.update(tls_task, total=tcp_open_count * len(snis))
+                    for sni in snis:
+                        await tls_q.put((ip, sni))
                 else:
-                    stats.fail += 1
-                    stats.tested += 1
+                    stats.fail += len(snis)
+                    stats.tested += len(snis)
                     _feed_fail(feed, "tcp", ip, f":{port} closed/timeout")
-                    progress.update(tcp_task, advance=1)
             except Exception as e:
-                stats.error += 1
-                stats.tested += 1
+                stats.error += len(snis)
+                stats.tested += len(snis)
                 _feed_err(feed, "tcp", ip, type(e).__name__)
-                progress.update(tcp_task, advance=1)
                 log.debug("tcp error %s", ip, exc_info=True)
             finally:
+                progress.update(tcp_task, advance=1)
                 in_q.task_done()
 
     async def tls_worker() -> None:
         while True:
-            ip = await tls_q.get()
+            ip, sni = await tls_q.get()
             try:
                 res = await tls_check(
                     ip,
                     port,
-                    snis,
+                    sni,
                     ctx,
                     tls_timeout,
                     retries=retries,
@@ -940,7 +930,8 @@ async def tcp_tls_pipeline(
                 )
                 if res is None:
                     stats.fail += 1
-                    _feed_fail(feed, "tls", ip, "no handshake")
+                    sni_disp = sni if sni is not None else "—"
+                    _feed_fail(feed, "tls", ip, f"sni={sni_disp} no handshake")
                 elif res.get("_error"):
                     stats.error += 1
                     _feed_err(feed, "tls", ip, "unexpected")
@@ -953,7 +944,7 @@ async def tcp_tls_pipeline(
                         stats.matched += 1
                     res["matched"] = is_match
                     names = ", ".join(res["names"][:2]) or "(no cert names)"
-                    sni_disp = res["sni"] if res["sni"] is not None else "\u2014"
+                    sni_disp = res["sni"] if res["sni"] is not None else "—"
                     _feed_ok(
                         feed,
                         "tls",
@@ -965,10 +956,9 @@ async def tcp_tls_pipeline(
             except Exception as e:
                 stats.error += 1
                 _feed_err(feed, "tls", ip, type(e).__name__)
-                log.debug("tls worker error %s", ip, exc_info=True)
+                log.debug("tls worker error %s sni=%r", ip, sni, exc_info=True)
             finally:
                 stats.tested += 1
-                progress.update(tcp_task, advance=1)
                 progress.update(tls_task, advance=1)
                 tls_q.task_done()
 
